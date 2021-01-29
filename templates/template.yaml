@@ -1,0 +1,188 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+AWSTemplateFormatVersion: 2010-09-09
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t2.micro
+    Description: Enter instance size. 
+  SSHKey:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: The key used to ssh the instance.
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+  PolicyForCloudWatchAgent:
+    Type: String
+    Default: arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+    Description: Policy to attach to the role to allow cloudwatch agent in EC2
+  BucketName:
+    Type: String
+    Description: Enter a name for your bucket
+  
+Resources:
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable SSH access via port 22 and HTTP via port 80
+      SecurityGroupIngress:
+      - CidrIp: 0.0.0.0/0
+        FromPort: 22
+        IpProtocol: tcp
+        ToPort: 22
+      - CidrIp: 0.0.0.0/0
+        FromPort: 80
+        IpProtocol: tcp
+        ToPort: 80
+
+  RoleForCloudWatchAgent:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - !Ref PolicyForCloudWatchAgent
+      RoleName: "CloudWatchAgentRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - "ec2.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Description: Role for CloudWatch Agent
+
+  InstanceProfileForCloudWatch:
+    Type: AWS::IAM::InstanceProfile
+    Properties: 
+      InstanceProfileName: InstanceProfileForCW
+      Roles: 
+        - Ref: "RoleForCloudWatchAgent"
+
+  Ec2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      KeyName: !Ref SSHKey
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfileForCloudWatch
+      SecurityGroups:
+        - !Ref InstanceSecurityGroup
+      Tags:
+        -
+          Key: Name
+          Value: Apache-Web-Server
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          wget https://raw.githubusercontent.com/aws-samples/amazon-cloudwatch-agent-to-archive-logs/main/templates/userData.sh
+          chmod +x userData.sh
+          ./userData.sh
+          
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties: 
+      BucketName: !Ref BucketName
+      LifecycleConfiguration:
+        Rules:
+          - Id: GlacierRule
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: '365'
+                StorageClass: GLACIER
+
+  FirehoseToS3Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: "FirehoseToS3Role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - "firehose.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+            Condition:
+              StringEquals:
+                "sts:ExternalId": !Ref "AWS::AccountId"
+      Policies:
+        - PolicyName: Permissions-Policy-For-Firehose
+          PolicyDocument:
+              Version: 2012-10-17
+              Statement:
+                - Effect: Allow
+                  Action:  
+                  - "s3:AbortMultipartUpload" 
+                  - "s3:GetBucketLocation"
+                  - "s3:GetObject"
+                  - "s3:ListBucket" 
+                  - "s3:ListBucketMultipartUploads"
+                  - "s3:PutObject"
+                  Resource: 
+                  - !Sub "arn:aws:s3:::${BucketName}"
+                  - !Sub "arn:aws:s3:::${BucketName}/*"
+      Description: Role for Firehose to S3
+
+  KinesisFirehoseDeliveryStream:
+    DependsOn:
+      - FirehoseToS3Role
+      - S3Bucket
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties: 
+      DeliveryStreamName: "My-Delivery-Stream"
+      S3DestinationConfiguration: 
+        RoleARN: !GetAtt FirehoseToS3Role.Arn
+        BucketARN: !GetAtt S3Bucket.Arn
+
+  CWLtoKinesisFirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: "CWLtoKinesisFirehoseRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - !Sub "logs.${AWS::Region}.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: Permissions-Policy-For-Firehose
+          PolicyDocument:
+              Version: 2012-10-17
+              Statement:
+                - Effect: Allow
+                  Action:  
+                  - "firehose:*" 
+                  Resource: 
+                  - !Sub "arn:aws:firehose:${AWS::Region}:${AWS::AccountId}:*"
+      Description: Role for CWL to Kinesis Firehose
+
+  CWLLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: "access_log"
+
+  CWLLogGroupError:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: "error_log"
+
+  CWLSubscriptionFilter:
+    DependsOn: CWLLogGroup
+    Type: AWS::Logs::SubscriptionFilter
+    Properties: 
+      DestinationArn: !GetAtt KinesisFirehoseDeliveryStream.Arn
+      FilterPattern: ""
+      LogGroupName: "access_log"
+      RoleArn: !GetAtt CWLtoKinesisFirehoseRole.Arn
+
+Outputs:
+  InstanceID:
+    Value: !Ref Ec2Instance
+  S3Bucket:
+    Value: !Ref BucketName  
