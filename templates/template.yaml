@@ -82,7 +82,7 @@ Resources:
           
   S3Bucket:
     Type: AWS::S3::Bucket
-    Properties: 
+    Properties:
       BucketName: !Ref BucketName
       LifecycleConfiguration:
         Rules:
@@ -91,6 +91,10 @@ Resources:
             Transitions:
               - TransitionInDays: '365'
                 StorageClass: GLACIER
+      BucketEncryption:
+        ServerSideEncryptionConfiguration: 
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256 
 
   FirehoseToS3Role:
     Type: AWS::IAM::Role
